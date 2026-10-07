@@ -13,6 +13,7 @@ namespace Symfony\Component\Scheduler\Tests;
 
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Cache\Adapter\ArrayAdapter;
+use Symfony\Component\Clock\MockClock;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
 use Symfony\Component\DependencyInjection\Exception\LogicException;
 use Symfony\Component\DependencyInjection\Kernel\AbstractKernel;
@@ -25,10 +26,13 @@ use Symfony\Component\Filesystem\Filesystem;
 use Symfony\Component\Messenger\Transport\Serialization\PhpSerializer;
 use Symfony\Component\Messenger\Transport\TransportFactory;
 use Symfony\Component\Scheduler\Command\DebugCommand;
+use Symfony\Component\Scheduler\Generator\MessageGenerator;
 use Symfony\Component\Scheduler\Messenger\SchedulerTransport;
+use Symfony\Component\Scheduler\Schedule;
 use Symfony\Component\Scheduler\SchedulerBundle;
 use Symfony\Component\Scheduler\Tests\Fixtures\AttributeScheduleProvider;
 use Symfony\Component\Scheduler\Tests\Fixtures\AttributeTask;
+use Symfony\Component\Scheduler\Tests\Fixtures\EveryMinuteAttributeTasks;
 
 class SchedulerBundleTest extends TestCase
 {
@@ -121,6 +125,60 @@ class SchedulerBundleTest extends TestCase
 
         $container->compile();
     }
+
+    public function testAttributeScheduleIsNotStatefulByDefault()
+    {
+        $kernel = new TestAttributeScheduleKernel('test', true, $this->varDir);
+        $kernel->boot();
+        $schedule = $kernel->getContainer()->get('test.default_schedule');
+
+        $this->assertNull($schedule->getState());
+        // a worker that stops mid-tick loses the rest of that tick, see https://github.com/symfony/symfony/issues/66544
+        $this->assertSame(['05:00:00 first', '05:01:00 first'], self::runWorkersHandlingOneMessageEach($schedule, 2));
+    }
+
+    public function testStatefulAttributeScheduleResumesATickInterruptedByAWorkerStop()
+    {
+        $kernel = new TestAttributeScheduleKernel('test', true, $this->varDir, [
+            'schedules' => ['default' => ['stateful' => 'cache.scheduler']],
+        ]);
+        $kernel->boot();
+        $container = $kernel->getContainer();
+        $schedule = $container->get('test.default_schedule');
+
+        $this->assertSame($container->get('test.cache'), $schedule->getState());
+        $this->assertSame(['05:00:00 first', '05:00:01 second'], self::runWorkersHandlingOneMessageEach($schedule, 2));
+    }
+
+    /**
+     * Mimics workers started with "messenger:consume --limit=1": each one handles a single message, then stops.
+     *
+     * @return list<string>
+     */
+    private static function runWorkersHandlingOneMessageEach(Schedule $schedule, int $workers): array
+    {
+        $clock = new MockClock('2026-10-02 04:59:30');
+        $handled = [];
+
+        for ($worker = 0; $worker < $workers; ++$worker) {
+            $generator = new MessageGenerator($schedule, 'default', $clock);
+
+            for ($second = 0; $second < 120; ++$second) {
+                foreach ($generator->getMessages() as $message) {
+                    $handled[] = $clock->now()->format('H:i:s').' '.$message->getMethod();
+
+                    break 2;
+                }
+
+                $clock->sleep(1);
+            }
+
+            // the next worker starts one second later
+            $clock->sleep(1);
+        }
+
+        return $handled;
+    }
 }
 
 class TestSchedulerKernel extends AbstractKernel
@@ -188,5 +246,44 @@ class TestSchedulerWithoutMessengerKernel extends AbstractKernel
                 ->set(AttributeScheduleProvider::class)->autoconfigure()
             ;
         }
+    }
+}
+
+class TestAttributeScheduleKernel extends AbstractKernel
+{
+    use KernelTrait;
+
+    public function __construct(string $env, bool $debug, private string $dir, private array $schedulerConfig = [])
+    {
+        parent::__construct($env, $debug);
+    }
+
+    public function getProjectDir(): string
+    {
+        return $this->dir;
+    }
+
+    public function registerBundles(): iterable
+    {
+        yield new SchedulerBundle();
+    }
+
+    private function configureContainer(ContainerConfigurator $container): void
+    {
+        if ($this->schedulerConfig) {
+            $container->extension('scheduler', $this->schedulerConfig);
+        }
+
+        $container->services()
+            ->set('messenger.transport_factory', TransportFactory::class)
+                ->args([[new Reference('scheduler.messenger_transport_factory')]])
+            ->set('messenger.default_serializer', PhpSerializer::class)
+            ->set('messenger.receiver_locator', ServiceLocator::class)
+                ->args([[]])
+            ->set('cache.app', ArrayAdapter::class)
+            ->set(EveryMinuteAttributeTasks::class)->autoconfigure()
+            ->alias('test.default_schedule', 'scheduler.provider.default')->public()
+            ->alias('test.cache', 'cache.scheduler')->public()
+        ;
     }
 }
