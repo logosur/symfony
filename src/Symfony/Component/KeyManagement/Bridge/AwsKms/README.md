@@ -39,13 +39,21 @@ DSN scheme
 ----------
 
 ```
-aws-kms://[<accessKey>:<secretKey>@]<host>[:<port>]?region=<region>[&session_token=<token>]
+aws-kms://[<accessKey>:<secretKey>@]<host>[:<port>]?region=<region>[&session_token=<token>&timeout=<seconds>&max_duration=<seconds>]
 ```
 
 The host `default` selects the public AWS endpoint for the given region;
 any other host is treated as a custom endpoint (LocalStack, VPC endpoint,
 ...). Leaving the credentials out lets `async-aws` fall back to the
 standard provider chain (env vars, instance profile, ...).
+
+The `timeout` (idle timeout) and `max_duration` (whole request) options set
+the HTTP client's timeouts. When the factory is given no client, it builds one
+with a 5-second `timeout` and a 10-second `max_duration`, wrapped in the AWS
+retry strategy. That client doesn't follow redirects. On a 307 or 308 redirect
+to another host, the plaintext would be sent again. A client given to the
+factory, like the application's `http_client`, is used as is and keeps its own
+settings unless the DSN sets the timeouts.
 
 Examples:
 

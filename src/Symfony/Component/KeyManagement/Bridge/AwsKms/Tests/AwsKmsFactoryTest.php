@@ -12,9 +12,13 @@
 namespace Symfony\Component\KeyManagement\Bridge\AwsKms\Tests;
 
 use AsyncAws\Core\AbstractApi;
+use AsyncAws\Core\HttpClient\AwsRetryStrategy;
 use AsyncAws\Kms\KmsClient;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\HttpClient\MockHttpClient;
+use Symfony\Component\HttpClient\Response\MockResponse;
+use Symfony\Component\HttpClient\RetryableHttpClient;
 use Symfony\Component\KeyManagement\Bridge\AwsKms\AwsKms;
 use Symfony\Component\KeyManagement\Bridge\AwsKms\AwsKmsFactory;
 use Symfony\Component\KeyManagement\Dsn;
@@ -132,6 +136,78 @@ class AwsKmsFactoryTest extends TestCase
         $httpClient = (new \ReflectionClass(AbstractApi::class))->getProperty('httpClient');
 
         $this->assertSame($client, $httpClient->getValue(self::getKmsClient($kms)));
+    }
+
+    public function testTimeoutOptionsAreAppliedToTheGivenHttpClient()
+    {
+        $timeouts = [];
+        $client = new MockHttpClient(static function (string $method, string $url, array $options) use (&$timeouts): MockResponse {
+            $timeouts[] = [$options['timeout'], $options['max_duration']];
+
+            return new MockResponse();
+        });
+
+        $kms = (new AwsKmsFactory($client))->create(Dsn::fromString('aws-kms://default?region=eu-west-1&timeout=2.5&max_duration=7'));
+        self::getHttpClient($kms)->request('POST', 'https://kms.eu-west-1.amazonaws.com/');
+
+        $this->assertSame([[2.5, 7.0]], $timeouts);
+    }
+
+    public function testTheClientBuiltByTheFactoryHasDefaultTimeoutsAndTheAwsRetryStrategy()
+    {
+        $kms = (new AwsKmsFactory())->create(Dsn::fromString('aws-kms://default?region=eu-west-1'));
+
+        $retryable = self::getHttpClient($kms);
+        $this->assertInstanceOf(RetryableHttpClient::class, $retryable);
+        $this->assertInstanceOf(AwsRetryStrategy::class, (new \ReflectionProperty(RetryableHttpClient::class, 'strategy'))->getValue($retryable));
+
+        $options = self::getDefaultOptions($retryable);
+        $this->assertSame(5.0, $options['timeout']);
+        $this->assertSame(10.0, $options['max_duration']);
+        $this->assertSame(0, $options['max_redirects']);
+    }
+
+    public function testTimeoutOptionsOverrideTheDefaultsOfTheClientBuiltByTheFactory()
+    {
+        $kms = (new AwsKmsFactory())->create(Dsn::fromString('aws-kms://default?region=eu-west-1&timeout=3&max_duration=60'));
+
+        $retryable = self::getHttpClient($kms);
+        $this->assertInstanceOf(RetryableHttpClient::class, $retryable);
+
+        $options = self::getDefaultOptions($retryable);
+        $this->assertSame(3.0, $options['timeout']);
+        $this->assertSame(60.0, $options['max_duration']);
+        $this->assertSame(0, $options['max_redirects']);
+    }
+
+    #[DataProvider('provideInvalidTimeoutOptions')]
+    public function testInvalidTimeoutOptionIsRejected(string $query, string $option)
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage(\sprintf('The "%s" option of the "aws-kms://" DSN must be positive.', $option));
+        (new AwsKmsFactory())->create(Dsn::fromString('aws-kms://default?region=eu-west-1&'.$query));
+    }
+
+    public static function provideInvalidTimeoutOptions(): iterable
+    {
+        yield ['timeout=0', 'timeout'];
+        yield ['timeout=-1', 'timeout'];
+        yield ['timeout=abc', 'timeout'];
+        yield ['timeout=1e999', 'timeout'];
+        yield ['max_duration=0', 'max_duration'];
+        yield ['max_duration=-5', 'max_duration'];
+    }
+
+    private static function getHttpClient(AwsKms $kms): object
+    {
+        return (new \ReflectionProperty(AbstractApi::class, 'httpClient'))->getValue(self::getKmsClient($kms));
+    }
+
+    private static function getDefaultOptions(RetryableHttpClient $retryable): array
+    {
+        $client = (new \ReflectionProperty(RetryableHttpClient::class, 'client'))->getValue($retryable);
+
+        return (new \ReflectionProperty($client, 'defaultOptions'))->getValue($client);
     }
 
     private static function getKmsClient(AwsKms $kms): KmsClient

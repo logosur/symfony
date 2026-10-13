@@ -12,7 +12,9 @@
 namespace Symfony\Component\KeyManagement\Bridge\AwsKms;
 
 use AsyncAws\Core\Configuration;
+use AsyncAws\Core\HttpClient\AwsHttpClientFactory;
 use AsyncAws\Kms\KmsClient;
+use Symfony\Component\HttpClient\HttpClient;
 use Symfony\Component\KeyManagement\DecrypterInterface;
 use Symfony\Component\KeyManagement\Dsn;
 use Symfony\Component\KeyManagement\EncrypterInterface;
@@ -24,7 +26,7 @@ use Symfony\Contracts\HttpClient\HttpClientInterface;
 /**
  * Builds an {@see AwsKms} from a DSN of the form:
  *
- *     aws-kms://[<accessKey>:<secretKey>@]<host>[:<port>]?region=eu-west-1[&session_token=...&scheme=http]
+ *     aws-kms://[<accessKey>:<secretKey>@]<host>[:<port>]?region=eu-west-1[&session_token=...&scheme=http&timeout=...&max_duration=...]
  *
  * The host `default` selects the public AWS endpoint for the given region;
  * any other host is treated as a custom endpoint (LocalStack, VPC endpoint,
@@ -33,10 +35,11 @@ use Symfony\Contracts\HttpClient\HttpClientInterface;
  * `scheme` option defaults to `https`; pass `http` to talk to a local
  * sandbox (LocalStack).
  *
- * The HTTP client given to the factory is the one async-aws talks through,
- * so that its timeout, its certificates and the profiler reach KMS. async-aws
- * retries throttled calls on the client it builds itself and takes a given one
- * as is, so a client passed here carries whatever retry policy it was given.
+ * The HTTP client given to the factory is the one async-aws talks through, so that its timeout, its certificates and the profiler reach KMS.
+ * async-aws takes it as is, so it carries whatever retry policy it was given.
+ * Without one, the factory builds a client with a 5-second idle timeout and a 10-second maximum duration, wrapped in the AWS retry strategy.
+ * This client doesn't follow redirects. On a 307 or 308 redirect to another host, the request body would be sent again, with the plaintext in it.
+ * The `timeout` and `max_duration` options, in seconds, override the timeouts on either client.
  *
  * @author Florent Morselli <florent.morselli@spomky-labs.com>
  *
@@ -45,6 +48,8 @@ use Symfony\Contracts\HttpClient\HttpClientInterface;
 final class AwsKmsFactory implements KmsFactoryInterface
 {
     private const string SCHEME = 'aws-kms';
+    private const float DEFAULT_TIMEOUT = 5.0;
+    private const float DEFAULT_MAX_DURATION = 10.0;
 
     /**
      * @param HttpClientInterface|null $client The client async-aws talks through, so that a timeout, certificates and the profiler set on the application's client reach the KMS
@@ -65,7 +70,8 @@ final class AwsKmsFactory implements KmsFactoryInterface
             throw new UnsupportedSchemeException($dsn, [self::SCHEME]);
         }
 
-        self::validateOptions($dsn, ['region', 'session_token', 'scheme']);
+        self::validateOptions($dsn, ['region', 'session_token', 'scheme', 'timeout', 'max_duration']);
+        $timeouts = self::timeoutOptions($dsn);
 
         if (null === $dsn->host || '' === $dsn->host) {
             throw new InvalidArgumentException('The "aws-kms://" DSN must include a host (use "default" for the public AWS endpoint).');
@@ -103,7 +109,7 @@ final class AwsKmsFactory implements KmsFactoryInterface
             $options['endpoint'] = $scheme.'://'.$dsn->host.(null !== $dsn->port ? ':'.$dsn->port : '');
         }
 
-        return new AwsKms(new KmsClient(Configuration::create($options), null, $this->client));
+        return new AwsKms(new KmsClient(Configuration::create($options), null, $this->httpClient($timeouts)));
     }
 
     /**
@@ -119,5 +125,34 @@ final class AwsKmsFactory implements KmsFactoryInterface
                 throw new InvalidArgumentException(\sprintf('The "%s" option of the "%s://" DSN must be a scalar value.', $option, $dsn->scheme));
             }
         }
+    }
+
+    /**
+     * @return array{timeout?: float, max_duration?: float}
+     */
+    private static function timeoutOptions(Dsn $dsn): array
+    {
+        $options = [];
+        foreach (['timeout', 'max_duration'] as $option) {
+            if (null === $value = $dsn->getOption($option)) {
+                continue;
+            }
+            if (!is_numeric($value) || !is_finite((float) $value) || (float) $value <= 0) {
+                throw new InvalidArgumentException(\sprintf('The "%s" option of the "%s://" DSN must be positive.', $option, $dsn->scheme));
+            }
+            $options[$option] = (float) $value;
+        }
+
+        return $options;
+    }
+
+    /**
+     * @param array{timeout?: float, max_duration?: float} $timeouts
+     */
+    private function httpClient(array $timeouts): HttpClientInterface
+    {
+        $client = $this->client ?? AwsHttpClientFactory::createRetryableClient(HttpClient::create(['timeout' => self::DEFAULT_TIMEOUT, 'max_duration' => self::DEFAULT_MAX_DURATION, 'max_redirects' => 0]));
+
+        return $timeouts ? $client->withOptions($timeouts) : $client;
     }
 }
